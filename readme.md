@@ -1,4 +1,4 @@
-# 🎙️ Modern TTS Audio Generator
+# VoicePy Local Version
 
 A sleek, modern desktop application for generating high-quality audio narrations from text documents using AI voices. Built with Python and powered by Coqui TTS.
 
@@ -166,12 +166,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [Coqui TTS](https://github.com/coqui-ai/TTS) - For the amazing TTS engine
 - [XTTS-v2](https://huggingface.co/coqui/XTTS-v2) - For the voice cloning model
-
-## 📧 Contact
-
-For questions, issues, or suggestions:
-- Open an issue on GitHub
-- Email: your.email@example.com
 
 ## 🌟 Star History
 
