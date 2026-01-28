@@ -1,633 +1,490 @@
-"""
-Modern Text-to-Speech Audio Generator
-A sleek desktop application for generating audio from text documents using AI voices.
-"""
-
 import os
-import re
 import time
-import threading
 from pathlib import Path
-from tkinter import *
-from tkinter import ttk, filedialog, messagebox
 from docx import Document
 import torch
+from shutil import copy2, rmtree
 from TTS.api import TTS
 from TTS.utils.synthesizer import Synthesizer
-import pygame
-from PIL import Image, ImageTk
+import io
+from contextlib import redirect_stdout
+import streamlit as st
+import psutil
+import re
+from datetime import datetime
 
 # =============================
-# CONFIGURATION
+# CONSOLE STATUS / LOG HELPERS
 # =============================
+_last_standby_print = 0.0
+
+class TerminalDisplay:
+    """Classe para exibir informações formatadas no terminal"""
+    
+    @staticmethod
+    def clear_screen():
+        """Limpa a tela do terminal"""
+        os.system('cls' if os.name == 'nt' else 'clear')
+    
+    @staticmethod
+    def print_header():
+        """Imprime o cabeçalho do painel"""
+        print("\n" + "="*80)
+        print("█" * 80)
+        print(f"{'DEDÉ LABS® - SISTEMA DE LOCUÇÃO':^80}")
+        print(f"{'Painel de Controle v1.04':^80}")
+        print("█" * 80)
+        print("="*80 + "\n")
+    
+    @staticmethod
+    def print_status_box(status: str, color_code: str = "37"):
+        """Imprime uma caixa de status colorida"""
+        status_map = {
+            "LIVRE": ("✅ SISTEMA LIVRE - Pode usar!", "42"),  # Verde
+            "EM_USO": ("🚫 SISTEMA EM USO - Alguém está gerando áudio!", "41"),  # Vermelho
+            "STANDBY": ("⏳ SISTEMA EM STANDBY - Aguardando ação...", "43"),  # Amarelo
+            "PROCESSANDO": ("⚙️  PROCESSANDO - Gerando áudios...", "44"),  # Azul
+        }
+        
+        msg, bg = status_map.get(status, (status, color_code))
+        
+        print("\n┌" + "─"*78 + "┐")
+        print(f"│\033[{bg};97m{msg:^78}\033[0m│")
+        print("└" + "─"*78 + "┘\n")
+    
+    @staticmethod
+    def print_info_table(info_dict: dict):
+        """Imprime tabela de informações"""
+        print("┌" + "─"*78 + "┐")
+        print(f"│ {'INFORMAÇÕES DO SISTEMA':^76} │")
+        print("├" + "─"*78 + "┤")
+        
+        for key, value in info_dict.items():
+            key_str = f"{key}:"
+            print(f"│ {key_str:<30} {str(value):<45} │")
+        
+        print("└" + "─"*78 + "┘\n")
+    
+    @staticmethod
+    def print_progress_bar(current: int, total: int, prefix: str = "Progresso"):
+        """Imprime barra de progresso"""
+        percent = (current / total) * 100 if total > 0 else 0
+        filled = int(50 * current / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (50 - filled)
+        
+        print(f"\r{prefix}: |{bar}| {percent:.1f}% ({current}/{total})", end="", flush=True)
+        
+        if current == total:
+            print()  # Nova linha ao completar
+
+terminal = TerminalDisplay()
+
+def _console(status: str, msg: str = ""):
+    """Log melhorado com timestamp e formatação"""
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Mapeia cores para diferentes tipos de status
+    color_map = {
+        "INFO": "\033[36m",      # Ciano
+        "EXECUTANDO": "\033[35m", # Magenta
+        "SUCESSO": "\033[32m",    # Verde
+        "ERRO": "\033[31m",       # Vermelho
+        "AVISO": "\033[33m",      # Amarelo
+        "STANDBY": "\033[37m",    # Branco
+        "FLUSH": "\033[34m",      # Azul
+    }
+    
+    color = color_map.get(status.upper(), "\033[37m")
+    reset = "\033[0m"
+    
+    # Símbolos para cada tipo
+    symbol_map = {
+        "INFO": "ℹ️ ",
+        "EXECUTANDO": "▶️ ",
+        "SUCESSO": "✅",
+        "ERRO": "❌",
+        "AVISO": "⚠️ ",
+        "STANDBY": "💤",
+        "FLUSH": "🧹",
+    }
+    
+    symbol = symbol_map.get(status.upper(), "•")
+    
+    try:
+        line = f"{color}[{ts}] {symbol} [{status.upper():^12}]{reset} {msg}"
+        print(line, flush=True)
+    except Exception:
+        pass
+
+def _console_standby_throttled(msg: str, interval: float = 8.0):
+    global _last_standby_print
+    now = time.time()
+    if now - _last_standby_print >= interval:
+        _console("STANDBY", msg)
+        _last_standby_print = now
+
+def update_terminal_display(status: str = "STANDBY", extra_info: dict = None):
+    """Atualiza o display completo do terminal"""
+    terminal.clear_screen()
+    terminal.print_header()
+    terminal.print_status_box(status)
+    
+    # Informações básicas do sistema
+    info = {
+        "Data/Hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "Modelo TTS": params.get("model_name", "N/A"),
+        "Dispositivo": params.get("device", "N/A"),
+        "Idioma": params.get("language", "N/A"),
+        "Status do Lock": "🔒 Bloqueado" if is_app_in_use() else "🔓 Livre",
+    }
+    
+    if extra_info:
+        info.update(extra_info)
+    
+    terminal.print_info_table(info)
+    
+    # Log de atividades recentes
+    print("📋 ÚLTIMAS ATIVIDADES:")
+    print("─" * 80)
+
+# =============================
+# CONFIGURAÇÕES GERAIS
+# =============================
+p = psutil.Process(os.getpid())
+try:
+    p.nice(psutil.HIGH_PRIORITY_CLASS)
+except Exception:
+    pass
+
 os.environ["COQUI_TOS_AGREED"] = "1"
 
 DEFAULT_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DEFAULT_OUTPUT_DIR = str(Path.home() / "TTS_Output")
+
+DOWNLOAD_PATH = r"C:\\Users\\dud\\Downloads\\youtube\\VIAJENS\\AUDIOS_FEITOS"
+textos_com_erro = []
 
 # =============================
-# UTILITIES
+# SISTEMA DE BLOQUEIO GLOBAL
+# =============================
+LOCK_FILE = Path("app_in_use.lock")
+
+def set_app_status(in_use: bool):
+    """Cria ou remove o arquivo de bloqueio para sinalizar uso."""
+    if in_use:
+        LOCK_FILE.write_text("IN_USE")
+        _console("INFO", "Sistema bloqueado para uso exclusivo")
+        update_terminal_display("EM_USO")
+    else:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink(missing_ok=True)
+        _console("INFO", "Sistema liberado para uso")
+        update_terminal_display("LIVRE")
+
+def is_app_in_use() -> bool:
+    """Verifica se o sistema está em uso por outro usuário."""
+    return LOCK_FILE.exists()
+
+def cleanup_stale_lock():
+    """Remove lock file antigo na inicialização"""
+    if LOCK_FILE.exists():
+        try:
+            # Remove o lock na inicialização
+            LOCK_FILE.unlink(missing_ok=True)
+            _console("INFO", "Lock antigo removido na inicialização")
+        except Exception as e:
+            _console("ERRO", f"Erro ao remover lock: {e}")
+
+# =============================
+# UTILITÁRIOS
 # =============================
 def sanitize_name(name: str) -> str:
-    """Clean filename from invalid characters."""
-    base = re.sub(r'[\\/:*?"<>|]', "_", name)
-    return re.sub(r"\s+", " ", base).strip()
+    base = re.sub(r"[\\/:*?\"<>|]", "_", name)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base
 
 def list_wav_files(folder: str):
-    """List all .wav files in a folder."""
     try:
         p = Path(folder)
         if not p.exists():
             return []
-        return sorted([str(f) for f in p.glob("*.wav")])
+        return [str(f.name) for f in p.glob("*.wav")]
     except Exception:
         return []
 
-# Patch for sentence splitting
+params = {
+    "remove_trailing_dots": True,
+    "voice": "",
+    "language": "pt",
+    "model_name": DEFAULT_MODEL,
+    "device": DEFAULT_DEVICE,
+}
+
 def new_split_into_sentences(self, text):
     sentences = self.seg.segment(text)
-    return [s[:-1] if s.endswith('.') and not s.endswith('...') else s for s in sentences]
+    if params['remove_trailing_dots']:
+        sentences_without_dots = []
+        for sentence in sentences:
+            if sentence.endswith('.') and not sentence.endswith('...'):
+                sentence = sentence[:-1]
+            sentences_without_dots.append(sentence)
+        return sentences_without_dots
+    else:
+        return sentences
 
 Synthesizer.split_into_sentences = new_split_into_sentences
 
 # =============================
-# MODERN GUI APPLICATION
+# CARREGAMENTO DO MODELO
 # =============================
-class ModernTTSApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("TTS Audio Generator")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 600)
-        
-        # Variables
-        self.model = None
-        self.is_generating = False
-        self.selected_voice = None
-        self.selected_docx = None
-        self.output_dir = DEFAULT_OUTPUT_DIR
-        
-        # Colors - Modern dark theme
-        self.bg_dark = "#1e1e2e"
-        self.bg_medium = "#2a2a3e"
-        self.bg_light = "#363650"
-        self.accent = "#6c63ff"
-        self.accent_hover = "#5a52d5"
-        self.text_color = "#e0e0e0"
-        self.success = "#00d4aa"
-        self.warning = "#ffd93d"
-        self.error = "#ff6b6b"
-        
-        self.root.configure(bg=self.bg_dark)
-        
-        # Initialize pygame for audio playback
-        pygame.mixer.init()
-        
-        self.setup_ui()
-        self.create_output_dir()
-        
-    def create_output_dir(self):
-        """Ensure output directory exists."""
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-        
-    def setup_ui(self):
-        """Create the modern UI layout."""
-        # Header
-        header = Frame(self.root, bg=self.bg_medium, height=80)
-        header.pack(fill=X, pady=(0, 20))
-        header.pack_propagate(False)
-        
-        title = Label(
-            header, 
-            text="🎙️ TTS Audio Generator",
-            font=("Segoe UI", 24, "bold"),
-            bg=self.bg_medium,
-            fg=self.text_color
-        )
-        title.pack(pady=20)
-        
-        # Main container
-        main = Frame(self.root, bg=self.bg_dark)
-        main.pack(fill=BOTH, expand=True, padx=30, pady=(0, 20))
-        
-        # Left panel - Voice selection
-        left_panel = self.create_card(main, "Voice Settings")
-        left_panel.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 10))
-        
-        self.create_voice_section(left_panel)
-        
-        # Right panel - Document processing
-        right_panel = self.create_card(main, "Document Processing")
-        right_panel.pack(side=RIGHT, fill=BOTH, expand=True, padx=(10, 0))
-        
-        self.create_document_section(right_panel)
-        
-        # Bottom panel - Progress and status
-        bottom_panel = Frame(self.root, bg=self.bg_dark)
-        bottom_panel.pack(fill=X, padx=30, pady=(0, 20))
-        
-        self.create_progress_section(bottom_panel)
-        
-    def create_card(self, parent, title):
-        """Create a modern card container."""
-        card = Frame(parent, bg=self.bg_medium, relief=FLAT)
-        card.pack(fill=BOTH, expand=True)
-        
-        card_title = Label(
-            card,
-            text=title,
-            font=("Segoe UI", 14, "bold"),
-            bg=self.bg_medium,
-            fg=self.text_color,
-            anchor=W
-        )
-        card_title.pack(fill=X, padx=20, pady=(15, 10))
-        
-        return card
-        
-    def create_voice_section(self, parent):
-        """Create voice selection UI."""
-        content = Frame(parent, bg=self.bg_medium)
-        content.pack(fill=BOTH, expand=True, padx=20, pady=(0, 20))
-        
-        # Voice folder selection
-        Label(
-            content,
-            text="Voice Folder:",
-            font=("Segoe UI", 10),
-            bg=self.bg_medium,
-            fg=self.text_color,
-            anchor=W
-        ).pack(fill=X, pady=(10, 5))
-        
-        folder_frame = Frame(content, bg=self.bg_medium)
-        folder_frame.pack(fill=X, pady=(0, 15))
-        
-        self.voice_folder_entry = Entry(
-            folder_frame,
-            font=("Segoe UI", 10),
-            bg=self.bg_light,
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            relief=FLAT
-        )
-        self.voice_folder_entry.pack(side=LEFT, fill=X, expand=True, ipady=8)
-        self.voice_folder_entry.insert(0, str(Path.home()))
-        
-        browse_btn = self.create_button(
-            folder_frame,
-            "Browse",
-            lambda: self.browse_voice_folder(),
-            width=10
-        )
-        browse_btn.pack(side=RIGHT, padx=(10, 0))
-        
-        # Voice list
-        Label(
-            content,
-            text="Available Voices:",
-            font=("Segoe UI", 10),
-            bg=self.bg_medium,
-            fg=self.text_color,
-            anchor=W
-        ).pack(fill=X, pady=(0, 5))
-        
-        list_frame = Frame(content, bg=self.bg_light)
-        list_frame.pack(fill=BOTH, expand=True, pady=(0, 15))
-        
-        scrollbar = Scrollbar(list_frame)
-        scrollbar.pack(side=RIGHT, fill=Y)
-        
-        self.voice_listbox = Listbox(
-            list_frame,
-            font=("Segoe UI", 9),
-            bg=self.bg_light,
-            fg=self.text_color,
-            selectbackground=self.accent,
-            selectforeground="white",
-            relief=FLAT,
-            yscrollcommand=scrollbar.set
-        )
-        self.voice_listbox.pack(fill=BOTH, expand=True, padx=5, pady=5)
-        scrollbar.config(command=self.voice_listbox.yview)
-        
-        # Preview button
-        preview_btn = self.create_button(
-            content,
-            "🔊 Preview Selected Voice",
-            self.preview_voice,
-            full_width=True
-        )
-        preview_btn.pack(fill=X)
-        
-        # Language selection
-        Label(
-            content,
-            text="Language:",
-            font=("Segoe UI", 10),
-            bg=self.bg_medium,
-            fg=self.text_color,
-            anchor=W
-        ).pack(fill=X, pady=(15, 5))
-        
-        self.language_var = StringVar(value="en")
-        lang_frame = Frame(content, bg=self.bg_medium)
-        lang_frame.pack(fill=X)
-        
-        for lang, label in [("en", "English"), ("pt", "Portuguese"), ("es", "Spanish")]:
-            Radiobutton(
-                lang_frame,
-                text=label,
-                variable=self.language_var,
-                value=lang,
-                font=("Segoe UI", 9),
-                bg=self.bg_medium,
-                fg=self.text_color,
-                selectcolor=self.bg_light,
-                activebackground=self.bg_medium,
-                activeforeground=self.text_color
-            ).pack(side=LEFT, padx=(0, 15))
-        
-    def create_document_section(self, parent):
-        """Create document processing UI."""
-        content = Frame(parent, bg=self.bg_medium)
-        content.pack(fill=BOTH, expand=True, padx=20, pady=(0, 20))
-        
-        # Document selection
-        Label(
-            content,
-            text="Document (.docx):",
-            font=("Segoe UI", 10),
-            bg=self.bg_medium,
-            fg=self.text_color,
-            anchor=W
-        ).pack(fill=X, pady=(10, 5))
-        
-        self.doc_label = Label(
-            content,
-            text="No document selected",
-            font=("Segoe UI", 9),
-            bg=self.bg_light,
-            fg="#888",
-            anchor=W,
-            padx=15,
-            pady=15,
-            relief=FLAT
-        )
-        self.doc_label.pack(fill=X, pady=(0, 10))
-        
-        select_doc_btn = self.create_button(
-            content,
-            "📄 Select Document",
-            self.select_document,
-            full_width=True
-        )
-        select_doc_btn.pack(fill=X, pady=(0, 15))
-        
-        # Output directory
-        Label(
-            content,
-            text="Output Directory:",
-            font=("Segoe UI", 10),
-            bg=self.bg_medium,
-            fg=self.text_color,
-            anchor=W
-        ).pack(fill=X, pady=(0, 5))
-        
-        output_frame = Frame(content, bg=self.bg_medium)
-        output_frame.pack(fill=X, pady=(0, 20))
-        
-        self.output_entry = Entry(
-            output_frame,
-            font=("Segoe UI", 10),
-            bg=self.bg_light,
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            relief=FLAT
-        )
-        self.output_entry.pack(side=LEFT, fill=X, expand=True, ipady=8)
-        self.output_entry.insert(0, self.output_dir)
-        
-        browse_output_btn = self.create_button(
-            output_frame,
-            "Browse",
-            self.browse_output_dir,
-            width=10
-        )
-        browse_output_btn.pack(side=RIGHT, padx=(10, 0))
-        
-        # Test TTS
-        Label(
-            content,
-            text="Test Text:",
-            font=("Segoe UI", 10),
-            bg=self.bg_medium,
-            fg=self.text_color,
-            anchor=W
-        ).pack(fill=X, pady=(0, 5))
-        
-        self.test_text = Text(
-            content,
-            font=("Segoe UI", 9),
-            bg=self.bg_light,
-            fg=self.text_color,
-            insertbackground=self.text_color,
-            relief=FLAT,
-            height=4,
-            wrap=WORD
-        )
-        self.test_text.pack(fill=X, pady=(0, 10))
-        self.test_text.insert("1.0", "This is a test of the text to speech system.")
-        
-        test_btn = self.create_button(
-            content,
-            "🎵 Generate Test Audio",
-            self.test_tts,
-            full_width=True
-        )
-        test_btn.pack(fill=X, pady=(0, 20))
-        
-        # Generate button
-        self.generate_btn = self.create_button(
-            content,
-            "⚡ Generate All Audio Files",
-            self.generate_audio,
-            full_width=True,
-            accent=True
-        )
-        self.generate_btn.pack(fill=X)
-        
-    def create_progress_section(self, parent):
-        """Create progress and status UI."""
-        # Status label
-        self.status_label = Label(
-            parent,
-            text="Ready",
-            font=("Segoe UI", 10),
-            bg=self.bg_dark,
-            fg=self.text_color,
-            anchor=W
-        )
-        self.status_label.pack(fill=X, pady=(0, 5))
-        
-        # Progress bar
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure(
-            "Custom.Horizontal.TProgressbar",
-            background=self.accent,
-            troughcolor=self.bg_medium,
-            borderwidth=0,
-            lightcolor=self.accent,
-            darkcolor=self.accent
-        )
-        
-        self.progress = ttk.Progressbar(
-            parent,
-            style="Custom.Horizontal.TProgressbar",
-            mode='determinate'
-        )
-        self.progress.pack(fill=X)
-        
-    def create_button(self, parent, text, command, width=None, full_width=False, accent=False):
-        """Create a modern styled button."""
-        bg = self.accent if accent else self.bg_light
-        hover_bg = self.accent_hover if accent else "#464660"
-        
-        btn = Button(
-            parent,
-            text=text,
-            command=command,
-            font=("Segoe UI", 10, "bold" if accent else "normal"),
-            bg=bg,
-            fg="white",
-            activebackground=hover_bg,
-            activeforeground="white",
-            relief=FLAT,
-            cursor="hand2",
-            padx=20,
-            pady=10
-        )
-        
-        if width:
-            btn.config(width=width)
-            
-        # Hover effects
-        btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg))
-        btn.bind("<Leave>", lambda e: btn.config(bg=bg))
-        
-        return btn
-        
-    def browse_voice_folder(self):
-        """Browse for voice folder."""
-        folder = filedialog.askdirectory(title="Select Voice Folder")
-        if folder:
-            self.voice_folder_entry.delete(0, END)
-            self.voice_folder_entry.insert(0, folder)
-            self.load_voices()
-            
-    def load_voices(self):
-        """Load available voice files."""
-        folder = self.voice_folder_entry.get()
-        voices = list_wav_files(folder)
-        
-        self.voice_listbox.delete(0, END)
-        for voice in voices:
-            self.voice_listbox.insert(END, Path(voice).name)
-            
-    def preview_voice(self):
-        """Preview selected voice file."""
-        selection = self.voice_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("No Selection", "Please select a voice first.")
-            return
-            
-        folder = self.voice_folder_entry.get()
-        voice_name = self.voice_listbox.get(selection[0])
-        voice_path = str(Path(folder) / voice_name)
-        
-        try:
-            pygame.mixer.music.load(voice_path)
-            pygame.mixer.music.play()
-            self.status_label.config(text=f"Playing: {voice_name}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not play voice: {e}")
-            
-    def select_document(self):
-        """Select document file."""
-        file = filedialog.askopenfilename(
-            title="Select Document",
-            filetypes=[("Word Documents", "*.docx")]
-        )
-        if file:
-            self.selected_docx = file
-            self.doc_label.config(
-                text=Path(file).name,
-                fg=self.success
-            )
-            
-    def browse_output_dir(self):
-        """Browse for output directory."""
-        folder = filedialog.askdirectory(title="Select Output Directory")
-        if folder:
-            self.output_dir = folder
-            self.output_entry.delete(0, END)
-            self.output_entry.insert(0, folder)
-            
-    def load_tts_model(self):
-        """Load TTS model (cached)."""
-        if self.model is None:
-            self.status_label.config(text="Loading TTS model...")
-            self.root.update()
-            self.model = TTS(DEFAULT_MODEL).to(DEFAULT_DEVICE)
-            self.status_label.config(text="Model loaded successfully")
-            
-    def test_tts(self):
-        """Test TTS with sample text."""
-        selection = self.voice_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("No Voice", "Please select a voice first.")
-            return
-            
-        text = self.test_text.get("1.0", END).strip()
-        if not text:
-            messagebox.showwarning("No Text", "Please enter test text.")
-            return
-            
-        def generate():
-            try:
-                self.load_tts_model()
-                
-                folder = self.voice_folder_entry.get()
-                voice_name = self.voice_listbox.get(selection[0])
-                voice_path = str(Path(folder) / voice_name)
-                
-                output = Path("_test_audio.wav")
-                
-                self.status_label.config(text="Generating test audio...")
-                self.model.tts_to_file(
-                    text=text,
-                    file_path=str(output),
-                    speaker_wav=voice_path,
-                    language=self.language_var.get(),
-                    speed=0.9
-                )
-                
-                self.status_label.config(text="Playing test audio...")
-                pygame.mixer.music.load(str(output))
-                pygame.mixer.music.play()
-                
-                # Clean up after playing
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.1)
-                output.unlink(missing_ok=True)
-                
-                self.status_label.config(text="Test completed successfully")
-                
-            except Exception as e:
-                self.status_label.config(text=f"Error: {str(e)}")
-                messagebox.showerror("Error", f"Failed to generate test audio:\n{e}")
-                
-        threading.Thread(target=generate, daemon=True).start()
-        
-    def generate_audio(self):
-        """Generate audio files from document."""
-        if self.is_generating:
-            messagebox.showinfo("Busy", "Already generating audio files.")
-            return
-            
-        selection = self.voice_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("No Voice", "Please select a voice first.")
-            return
-            
-        if not self.selected_docx:
-            messagebox.showwarning("No Document", "Please select a document first.")
-            return
-            
-        def process():
-            self.is_generating = True
-            self.generate_btn.config(state=DISABLED, text="⏳ Generating...")
-            
-            try:
-                self.load_tts_model()
-                
-                folder = self.voice_folder_entry.get()
-                voice_name = self.voice_listbox.get(selection[0])
-                voice_path = str(Path(folder) / voice_name)
-                
-                # Read document
-                doc = Document(self.selected_docx)
-                paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-                
-                # Create output folder
-                doc_name = sanitize_name(Path(self.selected_docx).stem)
-                output_folder = Path(self.output_dir) / f"{self.language_var.get()}_{doc_name}"
-                output_folder.mkdir(parents=True, exist_ok=True)
-                
-                # Generate audio files
-                total = len(paragraphs)
-                errors = []
-                
-                for i, text in enumerate(paragraphs):
-                    self.status_label.config(text=f"Processing {i+1}/{total}...")
-                    self.progress['value'] = (i + 1) / total * 100
-                    self.root.update()
-                    
-                    output_file = output_folder / f"audio_{i+1}.wav"
-                    
-                    try:
-                        self.model.tts_to_file(
-                            text=text,
-                            file_path=str(output_file),
-                            speaker_wav=voice_path,
-                            language=self.language_var.get(),
-                            speed=0.85
-                        )
-                    except Exception as e:
-                        errors.append((i+1, text, str(e)))
-                        continue
-                
-                # Save errors if any
-                if errors:
-                    error_doc = Document()
-                    error_doc.add_heading("Paragraphs with Errors", 0)
-                    for idx, text, error in errors:
-                        error_doc.add_heading(f"Paragraph {idx}", 1)
-                        error_doc.add_paragraph(text)
-                        error_doc.add_paragraph(f"Error: {error}")
-                    error_doc.save(output_folder / "errors.docx")
-                
-                self.progress['value'] = 100
-                self.status_label.config(text=f"Completed! {total - len(errors)}/{total} files generated")
-                
-                messagebox.showinfo(
-                    "Success",
-                    f"Generated {total - len(errors)} audio files!\n\nOutput folder:\n{output_folder}"
-                )
-                
-                # Open output folder
-                os.startfile(output_folder) if os.name == 'nt' else os.system(f'open "{output_folder}"')
-                
-            except Exception as e:
-                self.status_label.config(text=f"Error: {str(e)}")
-                messagebox.showerror("Error", f"Failed to generate audio:\n{e}")
-                
-            finally:
-                self.is_generating = False
-                self.generate_btn.config(state=NORMAL, text="⚡ Generate All Audio Files")
-                self.progress['value'] = 0
-                
-        threading.Thread(target=process, daemon=True).start()
+@st.cache_resource(show_spinner=True)
+def load_model(model_name: str, device: str):
+    _console("INFO", f"Carregando modelo: {model_name}")
+    return TTS(model_name).to(device)
+
+def flush_tts_cache():
+    """Força descarregar o modelo atual do cache e da GPU."""
+    try:
+        _console("FLUSH", "Limpando cache do modelo TTS...")
+        st.cache_resource.clear()
+        torch.cuda.empty_cache()
+        _console("SUCESSO", "Cache limpo com sucesso!")
+    except Exception as e:
+        _console("ERRO", f"Falha ao limpar cache: {e}")
 
 # =============================
-# MAIN ENTRY POINT
+# LEITURA DO DOCX
 # =============================
-def main():
-    root = Tk()
-    app = ModernTTSApp(root)
-    root.mainloop()
+@st.cache_data(show_spinner=False)
+def load_text(file_path):
+    doc = Document(file_path)
+    return [paragraph.text.replace('.', ',.') for paragraph in doc.paragraphs if paragraph.text.strip()]
+
+def generate_audio_filename(index):
+    return f"audio_{index + 1}.wav"
+
+# =============================
+# GERAÇÃO COM LOG
+# =============================
+def tts_to_file_logged(model, text: str, out_path: str, language: str, speaker_wav: str, speed: float = 0.85):
+    output_buffer = io.StringIO()
+    with redirect_stdout(output_buffer):
+        model.tts_to_file(
+            text=text,
+            file_path=out_path,
+            speaker_wav=speaker_wav,
+            language=language,
+            speed=speed,
+        )
+    return output_buffer.getvalue()
+
+# =============================
+# APP STREAMLIT
+# =============================
+def main_app():
+    # LIMPEZA DO LOCK NA INICIALIZAÇÃO
+    cleanup_stale_lock()
+    
+    # Inicialização do display no terminal
+    update_terminal_display("STANDBY", {
+        "GPU Disponível": "✅ Sim" if torch.cuda.is_available() else "❌ Não",
+        "Memória GPU": f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB" if torch.cuda.is_available() else "N/A"
+    })
+    
+    _console("INFO", "Aplicação Streamlit iniciada")
+    
+    st.set_page_config(page_title="Dedé Labs® -------- Créditos gratis: 2000", layout="wide")
+
+    st.title("Dedé Labs® -------- Créditos gratis: 2000")
+    st.caption("versão 1.04")
+
+    # ===================================
+    # AVISO DE USO ATIVO (BANNER GLOBAL)
+    # ===================================
+    app_status_placeholder = st.empty()
+    # sempre começa como liberado
+    app_status_placeholder.markdown(
+        "<div style='background-color:#4CAF50;padding:10px;border-radius:8px;text-align:center;color:white;font-weight:bold;'>✅ Pode usar! Ninguém está usando agora.</div>",
+        unsafe_allow_html=True
+    )
+
+    with st.sidebar:
+        st.subheader("Configurações")
+
+        language = st.radio("Idioma da narração", options=["pt", "es"], index=0, horizontal=True)
+        params["language"] = language
+
+        default_voice_dir = r"C:\\Users\\dud\\Downloads\\youtube\\scripts\\voices"
+        voice_dir = st.text_input("Pasta com vozes (.wav)", value=default_voice_dir)
+        wavs = list_wav_files(voice_dir)
+
+        if not wavs:
+            st.warning("Nenhum arquivo .wav encontrado nessa pasta.")
+        else:
+            selected_wav_name = st.selectbox("Escolha a voz (arquivo .wav)", wavs)
+            selected_wav_path = str(Path(voice_dir) / selected_wav_name)
+
+            # Se a voz mudou, força flush do modelo
+            if params.get("voice") and params["voice"] != selected_wav_path:
+                flush_tts_cache()
+
+            params["voice"] = selected_wav_path
+            _console("INFO", f"Voz selecionada: {selected_wav_name}")
+
+            st.markdown("**Pré-escuta da voz selecionada**")
+            try:
+                with open(selected_wav_path, "rb") as f:
+                    st.audio(f.read(), format="audio/wav")
+            except Exception as e:
+                st.error(f"Erro ao carregar preview da voz: {e}")
+
+        with st.expander("Opções avançadas"):
+            params["model_name"] = st.text_input("Modelo Coqui", value=params["model_name"])
+            params["device"] = st.selectbox("Dispositivo", ["cuda", "cpu"], index=0 if DEFAULT_DEVICE == "cuda" else 1)
+            params["remove_trailing_dots"] = st.checkbox("Remover ponto final simples de frases", value=True)
+
+    st.divider()
+
+    st.markdown("### Teste rápido da voz selecionada (TTS)")
+    sample_text = st.text_input("Texto de teste", value="Este é um teste de narração.")
+    if st.button("Reproduzir amostra gerada"):
+        if not params.get("voice"):
+            st.error("Selecione uma voz primeiro.")
+        elif is_app_in_use():
+            st.error("Outro usuário está usando agora. Aguarde o aviso verde.")
+        else:
+            set_app_status(True)
+            app_status_placeholder.markdown(
+                "<div style='background-color:#ff4d4d;padding:10px;border-radius:8px;text-align:center;color:white;font-weight:bold;'>🚫 Tem gente usando! Não mexa em nada agora.</div>",
+                unsafe_allow_html=True
+            )
+            try:
+                _console("EXECUTANDO", "Gerando amostra de teste...")
+                with st.spinner("Gerando amostra..."):
+                    model = load_model(params["model_name"], params["device"])
+                    tmp_sample = Path("./_tmp_sample.wav")
+                    _ = tts_to_file_logged(
+                        model,
+                        text=sample_text,
+                        out_path=str(tmp_sample),
+                        language=params["language"],
+                        speaker_wav=params["voice"],
+                        speed=0.9,
+                    )
+                    with open(tmp_sample, "rb") as f:
+                        st.audio(f.read(), format="audio/wav")
+                    _console("SUCESSO", "Amostra gerada com sucesso!")
+            finally:
+                if tmp_sample.exists():
+                    tmp_sample.unlink(missing_ok=True)
+                set_app_status(False)
+                app_status_placeholder.markdown(
+                    "<div style='background-color:#4CAF50;padding:10px;border-radius:8px;text-align:center;color:white;font-weight:bold;'>✅ Pode usar! Ninguém está usando agora.</div>",
+                    unsafe_allow_html=True
+                )
+
+    st.divider()
+
+    uploaded_file = st.file_uploader("Selecione o arquivo .docx", type="docx")
+    if uploaded_file is not None:
+        if is_app_in_use():
+            st.error("Outro usuário está gerando áudio agora. Aguarde o aviso verde.")
+            return
+
+        set_app_status(True)
+        app_status_placeholder.markdown(
+            "<div style='background-color:#ff4d4d;padding:10px;border-radius:8px;text-align:center;color:white;font-weight:bold;'>🚫 Tem gente usando! Não mexa em nada agora.</div>",
+            unsafe_allow_html=True
+        )
+
+        try:
+            _console("EXECUTANDO", f"Arquivo recebido: {uploaded_file.name}")
+            original_name = sanitize_name(uploaded_file.name)
+            base_name = os.path.splitext(original_name)[0]
+            new_folder_name = f"{params['language']}_{base_name}"
+            new_folder_path = os.path.join(DOWNLOAD_PATH, new_folder_name)
+            os.makedirs(new_folder_path, exist_ok=True)
+            
+            _console("INFO", f"Pasta de destino: {new_folder_path}")
+
+            docx_destination = os.path.join(new_folder_path, original_name)
+            with open(docx_destination, "wb") as f:
+                f.write(uploaded_file.read())
+
+            paragraphs = load_text(docx_destination)
+            _console("INFO", f"Total de parágrafos a processar: {len(paragraphs)}")
+            
+            update_terminal_display("PROCESSANDO", {
+                "Arquivo": uploaded_file.name,
+                "Total de parágrafos": len(paragraphs),
+                "Pasta destino": new_folder_name
+            })
+            
+            model = load_model(params["model_name"], params["device"])
+
+            st.write("Iniciando geração dos áudios...")
+            progress = st.progress(0)
+            log_placeholder = st.empty()
+            textos_com_erro.clear()
+            error_texts = []
+
+            for index, paragraph in enumerate(paragraphs):
+                output_file_name = generate_audio_filename(index)
+                output_file_path = os.path.join(new_folder_path, output_file_name)
+
+                st.write(f"Gerando áudio para o parágrafo {index + 1}/{len(paragraphs)}...")
+                _console("EXECUTANDO", f"Processando parágrafo {index + 1}/{len(paragraphs)}")
+                
+                # Atualiza barra de progresso no terminal
+                terminal.print_progress_bar(index + 1, len(paragraphs), "Geração de áudios")
+                
+                try:
+                    log = tts_to_file_logged(
+                        model,
+                        text=paragraph,
+                        out_path=output_file_path,
+                        language=params["language"],
+                        speaker_wav=params["voice"],
+                        speed=0.85,
+                    )
+                    log_placeholder.code(log or "(sem logs)")
+                    _console("SUCESSO", f"Áudio {index + 1} gerado: {output_file_name}")
+                except Exception as e:
+                    log_placeholder.error(f"Erro ao gerar áudio: {e}")
+                    _console("ERRO", f"Falha no parágrafo {index + 1}: {str(e)[:100]}")
+                    if "exceeds the character limit" in str(e).lower():
+                        error_texts.append(paragraph)
+                    continue
+
+                if "exceeds the character limit" in (log or "").lower():
+                    novo_nome = f"audio_{index + 1}__pode ter erro.wav"
+                    os.rename(output_file_path, os.path.join(new_folder_path, novo_nome))
+                    textos_com_erro.append(paragraph)
+                    _console("AVISO", f"Parágrafo {index + 1} pode conter erros")
+
+                progress.progress((index + 1) / len(paragraphs))
+
+            if error_texts or textos_com_erro:
+                error_docx_path = os.path.join(new_folder_path, "paragrafos_com_erro.docx")
+                error_doc = Document()
+                for t in error_texts + textos_com_erro:
+                    error_doc.add_paragraph(t)
+                error_doc.save(error_docx_path)
+                st.warning(f"Parágrafos com possível erro salvos em: {error_docx_path}")
+                _console("AVISO", f"{len(error_texts) + len(textos_com_erro)} parágrafos com erro salvos")
+
+            st.success("Processo de geração concluído!")
+            _console("SUCESSO", "🎉 Processo completo! Todos os áudios foram gerados.")
+            
+        finally:
+            set_app_status(False)
+            app_status_placeholder.markdown(
+                "<div style='background-color:#4CAF50;padding:10px;border-radius:8px;text-align:center;color:white;font-weight:bold;'>✅ Pode usar! Ninguém está usando agora.</div>",
+                unsafe_allow_html=True
+            )
+
+    if uploaded_file is None and not is_app_in_use():
+        _console_standby_throttled("💤 Sistema em standby - Aguardando ação do usuário.")
 
 if __name__ == "__main__":
-    main()
+    main_app()
