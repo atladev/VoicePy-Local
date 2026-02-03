@@ -1,6 +1,9 @@
 # VoicePy Local Version
 
-A sleek, modern desktop application for generating high-quality audio narrations from text documents using AI voices. Built with Python and powered by Coqui TTS.
+A sleek, modern desktop application for generating high-quality AI narrations from `.docx` documents using **Coqui TTS (XTTS v2)** and custom voice samples.  
+Each paragraph is converted into an individual audio file, making it ideal for YouTube videos, audiobooks, narration workflows, and content automation.
+
+Built with **Python**, **Streamlit**, and **Coqui TTS**.
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
